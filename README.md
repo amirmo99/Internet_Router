@@ -1,13 +1,12 @@
 ---
-title: P4 Internet_Router
-author: Amirmohammad Nazari
-date: Oct 7, 2022
+Title: P4 Internet Router
+Author: Amirmohammad Nazari
+Date: Oct 7, 2022
 ---
-# Amirmohammad Nazari
-GitHub repository for the "Building an Internet Router" course
 
 # Starter Project: Key-Value Service
 For this assignment, I am using the latest version of the RC-2.0.0 branch of P4aApp, and my system uses python3. My implementation details are as follows:
+
 ## Parser
 - Two states named check_request and check_header are responsible for checking the UDP header source and destination ports and finding out if the packet is a request or response or none of them. 
 - Two headers are defined for requests and responses, named reqHdr and resHdr respectively.
