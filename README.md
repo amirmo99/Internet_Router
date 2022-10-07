@@ -5,7 +5,7 @@ Date: Oct 7, 2022
 ---
 
 # Starter Project: Key-Value Service
-For this assignment, I am using the latest version of the RC-2.0.0 branch of P4aApp, and my system uses python3. My implementation details are as follows:
+For this assignment, I am using the latest version of the RC-2.0.0 branch of P4App, and my system uses python3. My implementation details are as follows:
 
 ## Parser
 - Two states named check_request and check_header are responsible for checking the UDP header source and destination ports and finding out if the packet is a request or response or none of them. 
