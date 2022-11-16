@@ -18,8 +18,8 @@ const port_t CPU_PORT           = 0x1;
 const bit<16> ARP_OP_REQ        = 0x0001;
 const bit<16> ARP_OP_REPLY      = 0x0002;
 
-const bit<8> IP_PROT_ICMP = 0x1;
-
+const bit<8> IP_PROT_ICMP = 0x01;
+const bit<8> IP_PROT_OSPF = 0x59;
 
 header ethernet_t {
     macAddr_t dstAddr;
@@ -31,6 +31,7 @@ header cpu_metadata_t {
     bit<8> fromCpu;
     bit<16> origEtherType;
     bit<16> srcPort;
+    bit<16> outPort;
 }
 
 header arp_t {
@@ -46,11 +47,6 @@ header arp_t {
     ip4Addr_t dstIP;
 }
 
-header icmp_t {
-    bit<16> typeCode;
-    bit<16> hdrChecksum;
-}
-
 header ipv4_t {
     bit<4>    version;
     bit<4>    ihl;
@@ -64,6 +60,14 @@ header ipv4_t {
     bit<16>   hdrChecksum;
     ip4Addr_t srcAddr;
     ip4Addr_t dstAddr;
+}
+
+header icmp_t {
+    bit<8> type;
+    bit<8> code;
+    bit<16> hdrChecksum;
+    bit<16> id;
+    bit<16> seq;
 }
 
 header ospf_t {
@@ -87,10 +91,10 @@ struct metadata {
 
 struct headers { 
     ethernet_t          ethernet;
-    ipv4_t              ipv4;
-    arp_t               arp;
-    icmp_t              icmp;
     cpu_metadata_t      cpu_metadata;
+    arp_t               arp;
+    ipv4_t              ipv4;
+    icmp_t              icmp;
     ospf_t              ospf;
 }
 
@@ -108,14 +112,30 @@ parser MyParser(packet_in packet,
         transition select(hdr.ethernet.etherType) {
             TYPE_IPV4: parse_ipv4;
             TYPE_ARP: parse_arp;
+            TYPE_CPU_METADATA: parse_cpu;
             default: accept;
         }
+    }
+
+    state parse_cpu {
+        packet.extract(hdr.cpu_metadata);
+        transition select(hdr.cpu_metadata.origEtherType) {
+            TYPE_IPV4: parse_ipv4;
+            TYPE_ARP: parse_arp;
+            default: accept;
+        }
+    }
+
+    state parse_arp {
+        packet.extract(hdr.arp);
+        transition accept;
     }
 
     state parse_ipv4 {
         packet.extract(hdr.ipv4);
         transition select(hdr.ipv4.protocol) {
             IP_PROT_ICMP: parse_icmp;
+            IP_PROT_OSPF: parse_ospf;
             default: accept;
         }
     }
@@ -125,8 +145,8 @@ parser MyParser(packet_in packet,
         transition accept;
     }
 
-    state parse_arp {
-        packet.extract(hdr.arp);
+    state parse_ospf {
+        packet.extract(hdr.ospf);
         transition accept;
     }
 
@@ -134,22 +154,22 @@ parser MyParser(packet_in packet,
 
 control MyVerifyChecksum(inout headers hdr, inout metadata meta) {   
     apply { 
-         verify_checksum(hdr.ipv4.isValid(),
-                { hdr.ipv4.version,
-                hdr.ipv4.ihl,
-                hdr.ipv4.diffserv,
-                hdr.ipv4.totalLen,
-                hdr.ipv4.identification,
-                hdr.ipv4.flags,
-                hdr.ipv4.fragOffset,
-                hdr.ipv4.ttl,
-                hdr.ipv4.protocol,
-                hdr.ipv4.hdrChecksum,
-                hdr.ipv4.srcAddr,
-                hdr.ipv4.dstAddr
-                },
-                hdr.ipv4.hdrChecksum,
-                HashAlgorithm.csum16);
+        //  verify_checksum(hdr.ipv4.isValid(),
+        //         { hdr.ipv4.version,
+        //         hdr.ipv4.ihl,
+        //         hdr.ipv4.diffserv,
+        //         hdr.ipv4.totalLen,
+        //         hdr.ipv4.identification,
+        //         hdr.ipv4.flags,
+        //         hdr.ipv4.fragOffset,
+        //         hdr.ipv4.ttl,
+        //         hdr.ipv4.protocol,
+        //         hdr.ipv4.hdrChecksum,
+        //         hdr.ipv4.srcAddr,
+        //         hdr.ipv4.dstAddr
+        //         },
+        //         hdr.ipv4.hdrChecksum,
+        //         HashAlgorithm.csum16);
     }
 }
 
@@ -177,6 +197,7 @@ control MyIngress(inout headers hdr,
         hdr.cpu_metadata.setValid();
         hdr.cpu_metadata.origEtherType = hdr.ethernet.etherType;
         hdr.cpu_metadata.srcPort = (bit<16>)standard_metadata.ingress_port;
+        hdr.cpu_metadata.outPort = 0;
         hdr.ethernet.etherType = TYPE_CPU_METADATA;
     }
 
@@ -190,21 +211,26 @@ control MyIngress(inout headers hdr,
         standard_metadata.egress_spec = CPU_PORT;
     }
 
+    action set_dmac(macAddr_t dmac) {
+        hdr.ethernet.dstAddr = dmac;
+    }
+
     action set_nhop(port_t port, ip4Addr_t ipv4) {
         set_egr(port);
         meta.routing.nhop_ipv4 = ipv4;
     }
 
-    action set_dmac(macAddr_t dmac) {
-        hdr.ethernet.dstAddr = dmac;
+    action hello_broadcast(ip4Addr_t ipv4) {
+        meta.routing.nhop_ipv4 = ipv4;
     }
 
     table routing_table {
         key = {
-            hdr.ipv4.dstAddr: ternary;
+            hdr.ipv4.dstAddr: lpm;
         }
         actions = {
             set_nhop;
+            hello_broadcast;
             NoAction;
             drop;
         }
@@ -217,6 +243,7 @@ control MyIngress(inout headers hdr,
             meta.routing.nhop_ipv4: exact;
         }
         actions = {
+            set_mgid;
             set_dmac;
             NoAction;
             drop;
@@ -230,7 +257,7 @@ control MyIngress(inout headers hdr,
             hdr.ipv4.dstAddr: exact;
         }
         actions = {
-            send_to_cpu;
+            // send_to_cpu;
             NoAction;
         }
         size = 64;
@@ -252,21 +279,30 @@ control MyIngress(inout headers hdr,
     }
 
     apply {
-        if (standard_metadata.ingress_port == CPU_PORT)
+        if (standard_metadata.ingress_port == CPU_PORT) {
+            // if the output port is set by the controller -> Just forward the packet through that port
+            if (hdr.cpu_metadata.outPort != 0) {
+                set_egr((bit<9>)hdr.cpu_metadata.outPort);
+                cpu_meta_decap();
+                return;
+            }
             cpu_meta_decap();
+        }
 
         // Sending Arp packets to CPU, or forward it if it's from CPU
         if (hdr.arp.isValid()) {
-            if (standard_metadata.ingress_port != CPU_PORT)
-                send_to_cpu();
-            else
+            if (standard_metadata.ingress_port == CPU_PORT)
                 fwd_l2.apply();
+            else 
+                send_to_cpu();
         } 
-
+        else if (hdr.ospf.isValid() && standard_metadata.ingress_port != CPU_PORT) {
+            send_to_cpu();
+        }
         // Handling IPv4 Packets
-        if (hdr.ipv4.isValid()) {
+        else if (hdr.ipv4.isValid()) {
             if (standard_metadata.checksum_error == 1 || hdr.ipv4.ttl == 0) {
-                // Drop in the case of checksum mismatch or 0 time-to-live
+                // Send_to_controller in the case of checksum mismatch or 0 time-to-live
                 drop();
             } 
             else {
@@ -278,10 +314,11 @@ control MyIngress(inout headers hdr,
                 // Applying routing table and arp table
                 else if (routing_table.apply().hit && arp_table.apply().hit) {
                     // Just forward the packet
-                    fwd_l2.apply();
+                    // drop();
                 }
                 else {
                     send_to_cpu();
+                    // drop();
                 }
             }
         }
@@ -341,10 +378,10 @@ control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
 control MyDeparser(packet_out packet, in headers hdr) {
     apply {
         packet.emit(hdr.ethernet);
-        packet.emit(hdr.ipv4);
-        packet.emit(hdr.arp);
-        packet.emit(hdr.icmp);
         packet.emit(hdr.cpu_metadata);
+        packet.emit(hdr.arp);
+        packet.emit(hdr.ipv4);
+        packet.emit(hdr.icmp);
         packet.emit(hdr.ospf);
     }
 }
