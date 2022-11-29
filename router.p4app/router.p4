@@ -2,12 +2,18 @@
 #include <core.p4>
 #include <v1model.p4>
 
+#define IP_PACKETS 0
+#define ARP_PACKETS 1
+#define CPU_PACKETS 2
+
 typedef bit<9>  egressSpec_t;
 typedef bit<48> macAddr_t;
 typedef bit<32> ip4Addr_t;
 typedef bit<8> key_t;
 typedef bit<16> mcastGrp_t;
 typedef bit<9> port_t;
+
+typedef bit<32> PacketCounter_t;
 
 const bit<16> TYPE_IPV4 = 0x800;
 const bit<16> TYPE_ARP = 0x806;
@@ -176,6 +182,8 @@ control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
 control MyIngress(inout headers hdr,
                   inout metadata meta,
                   inout standard_metadata_t standard_metadata) {
+
+    counter(4, CounterType.packets) c;
     
     action drop() {
         mark_to_drop(standard_metadata);
@@ -187,6 +195,10 @@ control MyIngress(inout headers hdr,
     
     action update_ttl() {
         hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
+    }
+
+    action increase_ttl() {
+        hdr.ipv4.ttl = hdr.ipv4.ttl + 1;
     }
 
     action set_egr(port_t port) {
@@ -208,7 +220,11 @@ control MyIngress(inout headers hdr,
 
     action send_to_cpu() {
         cpu_meta_encap();
-        standard_metadata.egress_spec = CPU_PORT;
+        set_egr(CPU_PORT);
+        if (hdr.ipv4.isValid()) {
+            increase_ttl(); // To make up for the extra decrement
+        }
+        c.count(CPU_PACKETS);
     }
 
     action set_dmac(macAddr_t dmac) {
@@ -217,7 +233,12 @@ control MyIngress(inout headers hdr,
 
     action set_nhop(port_t port, ip4Addr_t ipv4) {
         set_egr(port);
-        meta.routing.nhop_ipv4 = ipv4;
+        if (ipv4 != 0) {
+            meta.routing.nhop_ipv4 = ipv4;
+        }
+        else {
+            meta.routing.nhop_ipv4 = hdr.ipv4.dstAddr;
+        }
     }
 
     action hello_broadcast(ip4Addr_t ipv4) {
@@ -291,34 +312,49 @@ control MyIngress(inout headers hdr,
 
         // Sending Arp packets to CPU, or forward it if it's from CPU
         if (hdr.arp.isValid()) {
-            if (standard_metadata.ingress_port == CPU_PORT)
+            c.count(ARP_PACKETS);
+
+            if (standard_metadata.ingress_port == CPU_PORT) {
                 fwd_l2.apply();
-            else 
+                return;
+            }
+            else {
                 send_to_cpu();
+                return;
+            }
         } 
         else if (hdr.ospf.isValid() && standard_metadata.ingress_port != CPU_PORT) {
             send_to_cpu();
         }
         // Handling IPv4 Packets
         else if (hdr.ipv4.isValid()) {
-            if (standard_metadata.checksum_error == 1 || hdr.ipv4.ttl == 0) {
+            c.count(IP_PACKETS);
+            if ((standard_metadata.checksum_error == 1 && standard_metadata.ingress_port != CPU_PORT) || hdr.ipv4.ttl == 0) {
                 // Send_to_controller in the case of checksum mismatch or 0 time-to-live
                 drop();
+                return;
             } 
             else {
                 update_ttl();
                 // Sending local packets to CPU
                 if (local_table.apply().hit) {
                     send_to_cpu();
+                    return;
                 }
                 // Applying routing table and arp table
-                else if (routing_table.apply().hit && arp_table.apply().hit) {
+                if (routing_table.apply().hit) {
                     // Just forward the packet
-                    // drop();
+                    if (arp_table.apply().hit) {
+                        return;
+                    } 
+                    else {
+                        send_to_cpu();
+                        return;
+                    }
                 }
                 else {
                     send_to_cpu();
-                    // drop();
+                    return;
                 }
             }
         }
@@ -356,7 +392,7 @@ control MyEgress(inout headers hdr,
 }
 
 control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
-     apply {
+    apply {
 	update_checksum(
 	    hdr.ipv4.isValid(),
             { hdr.ipv4.version,

@@ -16,8 +16,8 @@ sw2 = net.get('s2')
 #print (sw1.intfs[1].prefixLen) # Attributes of intf: ip, mac, prefixLen
 
 # Start the MAC learning controller
-cpu1 = RouterController(sw1, routerID=1, areaID=1)
-cpu2 = RouterController(sw2, routerID=2, areaID=2)
+cpu1 = RouterController(sw1, areaID=1)
+cpu2 = RouterController(sw2, areaID=2)
 cpu1.start()
 cpu2.start()
 
