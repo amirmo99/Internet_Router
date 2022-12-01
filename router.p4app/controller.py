@@ -20,20 +20,22 @@ class RouterController(Thread):
         self.routing_entries = {}
         self.arp_entries = {}
         self.stop_event = Event()
-        self.ospfHelper = OSPFHelper(self, areaID)
         
         self.arp_timeout = 10
         self.waitingList = []
+        self.waitingLock = Lock()
+        self.routingLock = Lock()
         self.arpLock = Lock()
         
         self.populateTables()
+        self.ospfHelper = OSPFHelper(self, areaID)
         
         # Timer(5, self.timeoutTimer).start()
         
     def timeoutTimer(self):
         Timer(1, self.timeoutTimer).start()
         to_remove = []
-        with self.arpLock:
+        with self.waitingLock:
             for item in self.waitingList:
                 item[1] -= 1
                 if item[1] < 0:
@@ -62,25 +64,6 @@ class RouterController(Thread):
         
         # Arp entry for OSPF broadcast
         self.addArpEntry(ALLSPFRoutersIP, 'ff:ff:ff:ff:ff:ff')
-        
-        # Configuring ALLSPFRouter IP in the data plane
-        # self.router.insertTableEntry(table_name='MyIngress.routing_table',
-        #             match_fields={'hdr.ipv4.dstAddr': [ALLSPFRoutersIP, 32]},
-        #             action_name='MyIngress.hello_broadcast',
-        #             action_params={'ipv4': [ALLSPFRoutersIP]})
-        
-        # Setting up a multicast group for all ports except CPU
-        # self.router.addMulticastGroup(mgid=1, ports=range(2, len(self.router.intfs)))
-        
-        # self.router.insertTableEntry(table_name='MyIngress.arp_table',
-        #             match_fields={'meta.routing.nhop_ipv4': [ALLSPFRoutersIP]},
-        #             action_name='MyIngress.set_mgid',
-        #             action_params={'mgid': 1})
-        # self.router.insertTableEntry(table_name='MyIngress.fwd_l2',
-        #     match_fields={'hdr.ethernet.dstAddr': ["ff:ff:ff:ff:ff:ff"]},
-        #     action_name='MyIngress.set_mgid',
-        #     action_params={'mgid': 1})
-        
     
     def addMacAddr(self, mac, port):
         # Don't re-add the mac-port mapping if we already have it:
@@ -93,28 +76,39 @@ class RouterController(Thread):
         self.port_for_mac[mac] = port
         
     def addArpEntry(self, ip, mac):
-        if ip in self.arp_entries:
-            return
+        with self.arpLock:
+            if ip not in self.arp_entries:
+                self.router.insertTableEntry(table_name='MyIngress.arp_table',
+                            match_fields={'meta.routing.nhop_ipv4': [ip]},
+                            action_name='MyIngress.set_dmac',
+                            action_params={'dmac': mac})
+                self.arp_entries[ip] = mac
         
-        self.router.insertTableEntry(table_name='MyIngress.arp_table',
-                    match_fields={'meta.routing.nhop_ipv4': [ip]},
-                    action_name='MyIngress.set_dmac',
-                    action_params={'dmac': mac})
-        self.arp_entries[ip] = mac
+    def delArpEntry(self, ip, mac):
+        with self.arpLock:
+            entry = {'table_name':'MyIngress.arp_table', 'match_fields':{'meta.routing.nhop_ipv4': [ip]},
+                        'action_name':'MyIngress.set_dmac',
+                        'action_params':{'dmac': mac}}
+            self.router.removeTableEntry(entry=entry)
+            del self.arp_entries[ip]
+            
         
     def addRoutingEntry(self, subnet, prefixLen, port, nhop):
-        if (subnet, prefixLen) in self.routing_entries:
-            return
-        
-        entry = {'table_name':'MyIngress.routing_table', 'match_fields':{'hdr.ipv4.dstAddr': [subnet, prefixLen]},
-                    'action_name':'MyIngress.set_nhop',
-                    'action_params':{'port': [port], 'ipv4': [nhop]}}
-        
-        self.router.insertTableEntry(entry=entry)
-        self.routing_entries[(subnet, prefixLen)] = (port, nhop, entry)
+        with self.routingLock:
+            if (subnet, prefixLen) not in self.routing_entries:
+                entry = {'table_name':'MyIngress.routing_table', 'match_fields':{'hdr.ipv4.dstAddr': [subnet, prefixLen]},
+                            'action_name':'MyIngress.set_nhop',
+                            'action_params':{'port': [port], 'ipv4': [nhop]}}
+                
+                self.router.insertTableEntry(entry=entry)
+                self.routing_entries[(subnet, prefixLen)] = (port, nhop, entry)
         
     def delAllRoutingEntries(self):
-        self.routing_entries.clear()
+        with self.routingLock:
+            for item in self.routing_entries:
+                _, _, entry = self.routing_entries[item]
+                self.router.removeTableEntry(entry)
+            self.routing_entries.clear()
 
     def handleArpRequest(self, pkt):
         if pkt[ARP].pdst in self.switchIPs:
@@ -135,14 +129,15 @@ class RouterController(Thread):
         if pkt[ARP].pdst in self.switchIPs:
             print('Arp reply received!')
             to_remove = []
-            with self.arpLock:
+            with self.waitingLock:
                 for item in self.waitingList:
-                    if item[0][IP].dst in self.arp_entries:
+                    nhop = item[2]
+                    if nhop in self.arp_entries:
                         to_remove.append(item)
                 for item in to_remove:
                     self.waitingList.remove(item)
             for item in to_remove:
-                print('sending waiting packets')
+                print('sending waited packets')
                 self.send(item[0])
     
     def swapEther(self, pkt):
@@ -204,11 +199,13 @@ class RouterController(Thread):
         
 
     def findRouting(self, ip):
-        for subnet, prefixLen in self.routing_entries.keys():
-            maskedIP = self.ospfHelper.truncate(ipaddress.ip_address(ip), prefixLen)
-            if maskedIP == subnet:
-                return self.routing_entries[(subnet, prefixLen)][0]
-        return 0
+        port, nhop = 0,0
+        with self.routingLock:
+            for subnet, prefixLen in self.routing_entries.keys():
+                maskedIP = self.ospfHelper.truncate(ipaddress.ip_address(ip), prefixLen)
+                if maskedIP == subnet:
+                    port, nhop = self.routing_entries[(subnet, prefixLen)][0], self.routing_entries[(subnet, prefixLen)][1]
+        return port, nhop
             
     
 
@@ -217,13 +214,19 @@ class RouterController(Thread):
         assert CPUMetadata in pkt, "Controller must send packets with special header"
         # Check for routing entries if packet is not OSPF
         if IP in pkt and PWOSPF not in pkt:
-            port = self.findRouting(pkt[IP].dst)
+            port, nhop_tmp = self.findRouting(pkt[IP].dst)
+            nhop = None
+            if nhop_tmp == '0.0.0.0':
+                nhop = pkt[IP].dst
+            else:
+                nhop = nhop_tmp
             if (port == 0):
+                print('Did not find routing for the packet. Dropping...')
                 return # drop the packet
-            elif (pkt[IP].dst not in self.arp_entries):
-                with self.arpLock:
-                    self.waitingList.append([pkt, self.arp_timeout])
-                self.sendArp(pkt[IP].dst, port)
+            elif (nhop not in self.arp_entries):
+                with self.waitingLock:
+                    self.waitingList.append([pkt, self.arp_timeout, nhop])
+                self.sendArp(nhop, port)
                 return
         
         pkt[CPUMetadata].fromCpu = 1

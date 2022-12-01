@@ -7,13 +7,13 @@ from scapy.all import ARP, ICMP, IP, Ether, Packet, Raw
 from consts import *
 import io
 
-# import os
-# os.system('pip install networkx==2.2')
-# import networkx as nx
+import os
+os.system('pip install networkx==2.2')
+import networkx as nx
 
 
 class OSPFHelper:
-    def __init__(self, controller, areaID, hello_int=30, lsuint=30):
+    def __init__(self, controller, areaID, hello_int=40, lsuint=40):
         self.arp_table = {}
         self.neighborsTTL = {}
         self.global_routes = {}
@@ -28,24 +28,36 @@ class OSPFHelper:
         self.control_intf = controller.router.intfs[1]
         self.routerID = int(ipaddress.ip_address(self.control_intf.ip))
         self.neighbor_timeout = 3 * hello_int
+        self.routerID_to_ip = {}
         
+        self.global_topo = nx.Graph()
+        self.lsu_history = {}
         self.addInitialNeighbors()
+        self.constructGlobalTopo()
+        
         Timer(5, self.startHello).start()
         Timer(10, self.startLSU).start()
         # Timer(2, self.timeoutTimer).start()
     
     def addInitialNeighbors(self):
+        data = {} 
+        i = 0
+        # Adding initial neighbors
         for port, _ in self.router.intfs.items():
             if port >= 2:
                 self.addNeighbor(port, '0.0.0.0', 99999)
                 subnet, mask, prefixLen = self.getSubnetAndMask(port)
-                self.controller.addRoutingEntry(subnet, prefixLen, port, '0.0.0.0')
+                data[i] = {'subnet': subnet, 'mask': mask, 'neighborID': '0.0.0.0'}
+                i += 1
+                # self.controller.addRoutingEntry(subnet, prefixLen, port, '0.0.0.0')
+        # Create a fake lsu history for self
+        self.lsu_history[self.routerID] = {'seq': 0, 'data': data}
         
     def handlePacket(self, pkt):
         if pkt[PWOSPF].type == PWOSPF_TYPE_HELLO:
             self.handleHelloPacket(pkt)
         elif pkt[PWOSPF].type == PWOSPF_TYPE_LSU:
-            self.handleLSUPacket(pkt)
+            self.processLSUPacket(pkt)
         else:
             print('Unkown PWOSPF type received, dropping...')
     
@@ -58,18 +70,20 @@ class OSPFHelper:
         helloInt = payload.read(2)
         
         print('Hello packet data received at ID={}: '.format(ipaddress.ip_address(self.routerID)))
-        print(' RouterID: {}, netmask: {}, helloInt: {}'.format(ipaddress.ip_address(pkt[PWOSPF].routerID), netMask, helloInt))
+        # print(' RouterID: {}, netmask: {}, helloInt: {}'.format(ipaddress.ip_address(pkt[PWOSPF].routerID), netMask, helloInt))
         
         if (netMask == self.truncate("255.255.255.255", int(interface.prefixLen)) and
                     int.from_bytes(helloInt, 'big') == self.hello_int):
             self.addNeighbor(pkt[CPUMetadata].srcPort, routerID, self.neighbor_timeout)
         else:
             print("helloInt or netMask does not match!!!")
-    
-    def handleLSUPacket(self, pkt):
-        interface = self.router.intfs[pkt[CPUMetadata].srcPort]
         
-        routerID = pkt[PWOSPF].routerID
+        # Add routerID to ip
+        self.routerID_to_ip[str(ipaddress.ip_address(routerID))] = {'nhop': str(ipaddress.ip_address(pkt[IP].src)),
+                                                                    'port': pkt[CPUMetadata].srcPort}
+    
+    def processLSUPacket(self, pkt):
+        senderID = pkt[PWOSPF].routerID
         payload = io.BytesIO(bytes(pkt[Raw]))
         
         seq = int.from_bytes(payload.read(2), 'big')
@@ -80,14 +94,96 @@ class OSPFHelper:
         for i in range(n):
             subnet = str(ipaddress.ip_address(payload.read(4)))
             mask = str(ipaddress.ip_address(payload.read(4)))
-            id = str(ipaddress.ip_address(payload.read(4)))
-            data[i] = {'subnet': subnet, 'mask': mask, 'id': id}
+            neighborID = str(ipaddress.ip_address(payload.read(4)))
+            data[i] = {'subnet': subnet, 'mask': mask, 'neighborID': neighborID}
             
         print('LSU packet data received at ID={}: '.format(ipaddress.ip_address(self.routerID)))
-        print(data)
+        # print(data)
+        
+        # Drop if created by yourself
+        if ttl == 0:
+            print('Dropping the lsu packet due to zero TTL')
+            return
+        if self.routerID == senderID:
+            print('Dropping the lsu packet due to receiving own packet')
+            return
+        # Drop if seq matches the last received packet by this router
+        if senderID in self.lsu_history and self.lsu_history[senderID]['seq'] == seq:
+            print('Dropping the lsu packet due to receiving old seq number')
+            return
+        # Drop if data matches the last received packet by this router
+        if senderID in self.lsu_history and self.lsu_history[senderID]['data'] == data:
+            self.lsu_history[senderID]['seq'] = seq
+            print('Updating the sequence number: the lsu packet with same data as before')
+            return
+        
+        self.lsu_history[senderID] = {'seq': seq, 'data': data}
+        self.constructGlobalTopo()
+        self.addAllShortestPaths()
+        
+        self.broadcastOthersLSUPacket(pkt)
+        
     
-    def linkStateUpdate(self):
-        pass
+    def constructGlobalTopo(self):
+        self.global_topo.clear()
+        self.global_routes.clear()
+        self.controller.delAllRoutingEntries()
+        
+        for id in self.lsu_history:
+            self.updateTopoWithData(id, self.lsu_history[id]['data'])
+        
+        # print('Edges at id={}\n'.format(self.routerID), self.global_topo.edges)
+    
+    def addAllShortestPaths(self):
+        source = (str(ipaddress.ip_address(self.routerID)), '255.255.255.255')
+        shortest_paths = nx.shortest_path(self.global_topo, source=source)
+        
+        # Add direct connectivities
+        for port, _ in self.router.intfs.items():
+            if port >= 2:
+                subnet, mask, prefixLen = self.getSubnetAndMask(port)
+                self.controller.addRoutingEntry(subnet, prefixLen, port, '0.0.0.0')
+        
+        # print(shortest_paths)
+        # Add remote subnets
+        for dst in shortest_paths:
+            # Self router
+            if len(shortest_paths[dst]) == 1: continue
+            
+            nhop = shortest_paths[dst][1]
+            # If nhop is a router then add the entry
+            if nhop[1] == '255.255.255.255':
+                subnet, mask = dst
+                prefixLen = self.maskToPrefix(mask)
+                nhop_rid = nhop[0]
+                
+                if nhop_rid in self.routerID_to_ip:
+                    nhop_ip = self.routerID_to_ip[nhop_rid]['nhop']
+                    nhop_port = self.routerID_to_ip[nhop_rid]['port']
+                    
+                    self.controller.addRoutingEntry(subnet, prefixLen, nhop_port, nhop_ip)
+                else:
+                    print("Something is wrong in finding the neighbor router")
+                    
+            
+    def maskToPrefix(self, mask):
+        m = int(ipaddress.ip_address(mask))
+        i = 0
+        while m % 2 == 0:
+            m /= 2
+            i += 1
+        return 32 - i
+            
+        
+    def updateTopoWithData(self, id, data):
+        for i in data:
+            src = (str(ipaddress.ip_address(id)), '255.255.255.255')
+            dst = (0,0)
+            if data[i]['neighborID'] == '0.0.0.0':
+                dst = (data[i]['subnet'], data[i]['mask'])
+            else:
+                dst = (str(ipaddress.ip_address(data[i]['neighborID'])), '255.255.255.255')
+            self.global_topo.add_edge(src, dst)
 
     def getSubnetAndMask(self, port):
         intf = self.router.intfs[port]
@@ -99,7 +195,7 @@ class OSPFHelper:
         """ 
         Masks the ip with the appropriate prefix length
         """
-        assert (prefixLen < 32 and prefixLen >= 0)
+        assert (prefixLen <= 32 and prefixLen >= 0)
         shift = 32 - prefixLen
         ip_l = int(ipaddress.ip_address(ip))
         masked_l = (ip_l >> shift) << shift
@@ -135,7 +231,7 @@ class OSPFHelper:
         # Constructing the packet headers
         pkt = Ether(src=self.control_intf.mac, dst='ff:ff:ff:ff:ff:ff', type=TYPE_CPU_METADATA) / CPUMetadata(
             origEtherType=ETHER_TYPE_IP, outPort=port)
-        pkt = pkt / IP(src=self.control_intf.ip, dst=ALLSPFRoutersIP, proto=IP_PROTO_PWOSPF) 
+        pkt = pkt / IP(src=intf.ip, dst=ALLSPFRoutersIP, proto=IP_PROTO_PWOSPF) 
         pkt = pkt / PWOSPF(version=2, type=PWOSPF_TYPE_HELLO, routerID=self.routerID, areaID=self.areaID,
                            auType=0, authentication=0, totalLen=24)
         pkt = pkt / Raw(mask+hello+padding)
@@ -176,14 +272,33 @@ class OSPFHelper:
         pkt = pkt / PWOSPF(version=2, type=PWOSPF_TYPE_LSU, routerID=self.routerID, areaID=self.areaID,
                            auType=0, authentication=0, totalLen=24)
         pkt = pkt / Raw(seq + ttl + n.to_bytes(4, 'big') + data)
-        return pkt   
-                
+        return pkt
+
+    def modifyOthersLSUPacket(self, pkt, port, dstIP):
+        pkt[Ether].src = self.control_intf.mac
+        pkt[CPUMetadata].outPort = port
+        pkt[IP].dst = dstIP
+        pkt[IP].ttl -= 1
+        return pkt
+    
+    def broadcastOthersLSUPacket(self, pkt):
+        inPort = pkt[CPUMetadata].srcPort
+        
+        for port, intf in self.router.intfs.items():
+            if port >= 2 and port != inPort:
+                for id in self.neighborsTTL[port].keys():
+                    # We wont send hello packets to the endhosts
+                    if id != '0.0.0.0':
+                        pkt2 = self.modifyOthersLSUPacket(pkt, port, dstIP=id)     
+                        self.controller.send(pkt2)
+                        
     def startLSU(self):
         Timer(self.lsuint, self.startLSU).start()
         # Send LSU on each interface
         for port, intf in self.router.intfs.items():
             if port >= 2:
                 for id in self.neighborsTTL[port].keys():
+                    # We wont send hello packets to the endhosts
                     if id != '0.0.0.0':
                         pkt = self.genLSU(port, dstIP=id)
                         self.controller.send(pkt)
