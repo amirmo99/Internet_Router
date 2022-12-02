@@ -28,18 +28,37 @@ class OSPFHelper:
         self.control_intf = controller.router.intfs[1]
         self.routerID = int(ipaddress.ip_address(self.control_intf.ip))
         self.neighbor_timeout = 3 * hello_int
-        self.routerID_to_ip = {}
+        self.routerID_to_ip = {} # Helpful dict that keeps track of the interface ip address of the neighboring router. 
         
         self.global_topo = nx.Graph()
         self.lsu_history = {}
         self.addInitialNeighbors()
         self.constructGlobalTopo()
+        self.addAllShortestPaths()
         
         Timer(5, self.startHello).start()
         Timer(10, self.startLSU).start()
         # Timer(2, self.timeoutTimer).start()
+        
+    # def timeoutTimer(self):
+    #     Timer(1, self.timeoutTimer).start()
+    #     to_remove = []
+    #     for ip in self.lsu_history:
+    #         self.lsu_history[ip]['time'] -= 1
+    #         if self.lsu_history[ip]['time'] < 0:
+    #             to_remove.append(ip)
+        
+    #     if len(to_remove) > 0:
+    #         for ip in to_remove:
+    #             del self.lsu_history[ip]
+    #         self.constructGlobalTopo()
+    #         self.addAllShortestPaths()
     
     def addInitialNeighbors(self):
+        """
+        Adds directly connected subnets to the list of neighbors. Also creates a fake LSU data for itself to be used later by 
+        constructGlobalTopo.
+        """
         data = {} 
         i = 0
         # Adding initial neighbors
@@ -49,11 +68,13 @@ class OSPFHelper:
                 subnet, mask, prefixLen = self.getSubnetAndMask(port)
                 data[i] = {'subnet': subnet, 'mask': mask, 'neighborID': '0.0.0.0'}
                 i += 1
-                # self.controller.addRoutingEntry(subnet, prefixLen, port, '0.0.0.0')
         # Create a fake lsu history for self
-        self.lsu_history[self.routerID] = {'seq': 0, 'data': data}
+        self.lsu_history[self.routerID] = {'seq': 0, 'data': data, 'time': 99999999}
         
     def handlePacket(self, pkt):
+        """
+        The function that is called when receiving a PWOSPF packet by controller. 
+        """
         if pkt[PWOSPF].type == PWOSPF_TYPE_HELLO:
             self.handleHelloPacket(pkt)
         elif pkt[PWOSPF].type == PWOSPF_TYPE_LSU:
@@ -62,6 +83,10 @@ class OSPFHelper:
             print('Unkown PWOSPF type received, dropping...')
     
     def handleHelloPacket(self, pkt):
+        """
+        Reads the hello packet. Checks the netmask and hello_int match the source interface values, and add the sender of the packet
+        to the list of neighbors.
+        """
         interface = self.router.intfs[pkt[CPUMetadata].srcPort]
         
         routerID = pkt[PWOSPF].routerID
@@ -78,11 +103,14 @@ class OSPFHelper:
         else:
             print("helloInt or netMask does not match!!!")
         
-        # Add routerID to ip
+        # Saves the nhop value if we're later required to forward packets to this router.
         self.routerID_to_ip[str(ipaddress.ip_address(routerID))] = {'nhop': str(ipaddress.ip_address(pkt[IP].src)),
                                                                     'port': pkt[CPUMetadata].srcPort}
     
     def processLSUPacket(self, pkt):
+        """
+        Reads the incoming packet. Drop it if seq is old
+        """
         senderID = pkt[PWOSPF].routerID
         payload = io.BytesIO(bytes(pkt[Raw]))
         
@@ -111,15 +139,14 @@ class OSPFHelper:
         if senderID in self.lsu_history and self.lsu_history[senderID]['seq'] == seq:
             print('Dropping the lsu packet due to receiving old seq number')
             return
-        # Drop if data matches the last received packet by this router
+        # Update seq if data matches the last received packet by this router
         if senderID in self.lsu_history and self.lsu_history[senderID]['data'] == data:
             self.lsu_history[senderID]['seq'] = seq
             print('Updating the sequence number: the lsu packet with same data as before')
-            return
-        
-        self.lsu_history[senderID] = {'seq': seq, 'data': data}
-        self.constructGlobalTopo()
-        self.addAllShortestPaths()
+        else:
+            self.lsu_history[senderID] = {'seq': seq, 'data': data, 'time': self.neighbor_timeout}
+            self.constructGlobalTopo()
+            self.addAllShortestPaths()
         
         self.broadcastOthersLSUPacket(pkt)
         
