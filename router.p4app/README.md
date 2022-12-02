@@ -4,7 +4,7 @@ All parts are done except dynamic routing timeouts! Sample topology is as follow
 
                                      -----s3 --- h4
                                     |     |
-  network:                  h1 --- s1 --- s2 --- h2
+                      h1 --- s1 --- s2 --- h2
                                     |
                                    h3
 
