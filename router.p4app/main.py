@@ -31,15 +31,16 @@ sleep(2)
 # cpu1.addRoutingEntry(subnet='20.10.0.0', prefixLen=24, port=2, nhop='0.0.0.0', static=True)
 
 ## Staring the CLI
-CLI(net)
+# CLI(net)
 
 h1, h2 = net.get('h1'), net.get('h2')
 h3, h4 = net.get('h3'), net.get('h4')
 
 sleep(15)
-# print (h2.cmd('ping -c3 10.0.4.10'))
-print (h1.cmd('ping -c3 10.0.4.10'))
-# print (h3.cmd('ping -c3 10.0.1.200'))
+print (h2.cmd('ping -c3 10.0.3.10')) # Should be successful
+print (h1.cmd('ping -c3 10.0.4.10')) # Should be successful
+print (h3.cmd('ping -c1 10.0.1.200')) # Should receive Host Unreachable
+print (h4.cmd('ping -c1 10.0.37.200')) # Should receive Net Unreachable
 
 sleep(5)
 

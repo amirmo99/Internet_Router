@@ -79,7 +79,7 @@ class RouterController(Thread):
         """ 
         Send an ICMP destination unreachable packet to the source address of pkt with the given ICMP code. 
         """
-        print('Len:', len(self.router.intfs), ', port:', pkt[CPUMetadata].srcPort)
+        # print('Len:', len(self.router.intfs), ', port:', pkt[CPUMetadata].srcPort)
         srcip = self.router.intfs[pkt[CPUMetadata].srcPort].ip
         srcmac = self.router.intfs[pkt[CPUMetadata].srcPort].mac
         # Constructing the ICMP packet
